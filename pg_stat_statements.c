@@ -21,10 +21,11 @@
  *
  * Note about locking issues: to create or delete an entry in the shared
  * hashtable, one must hold pgss->lock exclusively.  Modifying any field
- * in an entry except the counters requires the same.  To look up an entry,
- * one must hold the lock shared.  To read or update the counters within
- * an entry, one must hold the lock shared or exclusive (so the entry doesn't
- * disappear!) and also take the entry's mutex spinlock.
+ * in an entry except the counters (and stats_last, eXperDB) requires the
+ * same.  To look up an entry, one must hold the lock shared.  To read or
+ * update the counters or stats_last within an entry, one must hold the lock
+ * shared or exclusive (so the entry doesn't disappear!) and also take the
+ * entry's mutex spinlock.
  * The shared state variable pgss->extent (the next free spot in the external
  * query-text file) should be accessed only while holding either the
  * pgss->mutex spinlock, or exclusive lock on pgss->lock.  We use the mutex to
@@ -85,7 +86,12 @@ PG_MODULE_MAGIC;
 #define PGSS_TEXT_FILE	PG_STAT_TMP_DIR "/pgss_query_texts.stat"
 
 /* Magic number identifying the stats file format */
-static const uint32 PGSS_FILE_HEADER = 0x20220408;
+/*
+ * eXperDB 1.11e2: pgssEntry carries an extra stats_last field, so the
+ * on-disk layout differs from upstream 1.11 (0x20220408) and from 1.11e1.
+ * A distinct header makes pgss_shmem_startup() discard those files.
+ */
+static const uint32 PGSS_FILE_HEADER = 0x20251002;
 
 /* PostgreSQL major version number, changes in which invalidate all entries */
 static const uint32 PGSS_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
@@ -112,7 +118,11 @@ typedef enum pgssVersion
 	PGSS_V1_8,
 	PGSS_V1_9,
 	PGSS_V1_10,
+	PGSS_V1_10E2,				/* eXperDB: 1.10 + stats_last + stats_since (PostgreSQL 15/16 definition) */
+	PGSS_V1_10E1,				/* eXperDB: legacy 1.10e1 SQL definition (PostgreSQL 15/16) */
 	PGSS_V1_11,
+	PGSS_V1_11E2,				/* eXperDB: 1.11 + stats_last */
+	PGSS_V1_11E1,				/* eXperDB: legacy 1.11e1 SQL definition */
 } pgssVersion;
 
 typedef enum pgssStoreKind
@@ -231,7 +241,8 @@ typedef struct pgssEntry
 	int			encoding;		/* query text encoding */
 	TimestampTz stats_since;	/* timestamp of entry allocation */
 	TimestampTz minmax_stats_since; /* timestamp of last min/max values reset */
-	slock_t		mutex;			/* protects the counters only */
+	TimestampTz stats_last;		/* eXperDB: timestamp of last counters update */
+	slock_t		mutex;			/* protects the counters and stats_last */
 } pgssEntry;
 
 /*
@@ -317,7 +328,9 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_1_3);
 PG_FUNCTION_INFO_V1(pg_stat_statements_1_8);
 PG_FUNCTION_INFO_V1(pg_stat_statements_1_9);
 PG_FUNCTION_INFO_V1(pg_stat_statements_1_10);
+PG_FUNCTION_INFO_V1(pg_stat_statements_1_10e2);
 PG_FUNCTION_INFO_V1(pg_stat_statements_1_11);
+PG_FUNCTION_INFO_V1(pg_stat_statements_1_11e2);
 PG_FUNCTION_INFO_V1(pg_stat_statements);
 PG_FUNCTION_INFO_V1(pg_stat_statements_info);
 
@@ -660,6 +673,7 @@ pgss_shmem_startup(void)
 		entry->counters = temp.counters;
 		entry->stats_since = temp.stats_since;
 		entry->minmax_stats_since = temp.minmax_stats_since;
+		entry->stats_last = temp.stats_last;
 	}
 
 	/* Read global statistics for pg_stat_statements */
@@ -1385,6 +1399,8 @@ pgss_store(const char *query, uint64 queryId,
 		 * locking rules at the head of the file)
 		 */
 		volatile pgssEntry *e = (volatile pgssEntry *) entry;
+		/* eXperDB: take the timestamp before entering the spinlock */
+		TimestampTz stats_last = GetCurrentTimestamp();
 
 		Assert(kind == PGSS_PLAN || kind == PGSS_EXEC);
 
@@ -1455,6 +1471,9 @@ pgss_store(const char *query, uint64 queryId,
 		e->counters.wal_records += walusage->wal_records;
 		e->counters.wal_fpi += walusage->wal_fpi;
 		e->counters.wal_bytes += walusage->wal_bytes;
+		/* eXperDB: keep stats_last monotonic under concurrent updates */
+		if (stats_last > e->stats_last)
+			e->stats_last = stats_last;
 		if (jitusage)
 		{
 			e->counters.jit_functions += jitusage->created_functions;
@@ -1542,8 +1561,12 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
 #define PG_STAT_STATEMENTS_COLS_V1_8	32
 #define PG_STAT_STATEMENTS_COLS_V1_9	33
 #define PG_STAT_STATEMENTS_COLS_V1_10	43
+#define PG_STAT_STATEMENTS_COLS_V1_10E2	45	/* eXperDB: 1.10 + stats_last + stats_since (PostgreSQL 15/16) */
+#define PG_STAT_STATEMENTS_COLS_V1_10E1	46	/* eXperDB: legacy 1.10e1 (+ bind_types), PostgreSQL 15/16 */
 #define PG_STAT_STATEMENTS_COLS_V1_11	49
-#define PG_STAT_STATEMENTS_COLS			49	/* maximum of above */
+#define PG_STAT_STATEMENTS_COLS_V1_11E2	50	/* eXperDB: 1.11 + stats_last */
+#define PG_STAT_STATEMENTS_COLS_V1_11E1	51	/* eXperDB: legacy 1.11e1 (+ bind_types) */
+#define PG_STAT_STATEMENTS_COLS			51	/* maximum of above */
 
 /*
  * Retrieve statement statistics.
@@ -1561,6 +1584,34 @@ pg_stat_statements_1_11(PG_FUNCTION_ARGS)
 	bool		showtext = PG_GETARG_BOOL(0);
 
 	pg_stat_statements_internal(fcinfo, PGSS_V1_11, showtext);
+
+	return (Datum) 0;
+}
+
+/* eXperDB 1.11e2: the 1.11 column set plus stats_last */
+Datum
+pg_stat_statements_1_11e2(PG_FUNCTION_ARGS)
+{
+	bool		showtext = PG_GETARG_BOOL(0);
+
+	pg_stat_statements_internal(fcinfo, PGSS_V1_11E2, showtext);
+
+	return (Datum) 0;
+}
+
+/*
+ * eXperDB 1.10e2 (PostgreSQL 15/16): the 1.10 column set plus stats_last and
+ * stats_since.  A cluster upgraded with pg_upgrade from PostgreSQL 15/16 keeps
+ * that SQL definition until ALTER EXTENSION ... UPDATE TO '1.11e2'; the
+ * symbol must exist for pg_upgrade to restore it, and serving it keeps the
+ * view readable in between.
+ */
+Datum
+pg_stat_statements_1_10e2(PG_FUNCTION_ARGS)
+{
+	bool		showtext = PG_GETARG_BOOL(0);
+
+	pg_stat_statements_internal(fcinfo, PGSS_V1_10E2, showtext);
 
 	return (Datum) 0;
 }
@@ -1695,9 +1746,46 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			if (api_version != PGSS_V1_10)
 				elog(ERROR, "incorrect number of output arguments");
 			break;
+		case PG_STAT_STATEMENTS_COLS_V1_10E2:
+			/*
+			 * eXperDB: the 1.10e2 definition of PostgreSQL 15/16 (bound to
+			 * pg_stat_statements_1_10e2).  The 1.10e1 package also shipped a
+			 * 45-column "1.10" definition bound to pg_stat_statements_1_10; serve
+			 * that one too, as the PostgreSQL 15/16 library does.
+			 */
+			if (api_version != PGSS_V1_10E2 && api_version != PGSS_V1_10)
+				elog(ERROR, "incorrect number of output arguments");
+			api_version = PGSS_V1_10E2;
+			break;
+		case PG_STAT_STATEMENTS_COLS_V1_10E1:
+			/*
+			 * eXperDB: the legacy 1.10e1 SQL definition of PostgreSQL 15/16 (46
+			 * columns, ending in bind_types) is bound to pg_stat_statements_1_10.
+			 * Serve it, with bind_types NULL, so the view works after pg_upgrade
+			 * until ALTER EXTENSION ... UPDATE TO '1.11e2'.
+			 */
+			if (api_version != PGSS_V1_10)
+				elog(ERROR, "incorrect number of output arguments");
+			api_version = PGSS_V1_10E1;
+			break;
 		case PG_STAT_STATEMENTS_COLS_V1_11:
 			if (api_version != PGSS_V1_11)
 				elog(ERROR, "incorrect number of output arguments");
+			break;
+		case PG_STAT_STATEMENTS_COLS_V1_11E2:
+			if (api_version != PGSS_V1_11E2)
+				elog(ERROR, "incorrect number of output arguments");
+			break;
+		case PG_STAT_STATEMENTS_COLS_V1_11E1:
+			/*
+			 * eXperDB: the legacy 1.11e1 SQL definition (51 columns, ending in
+			 * bind_types) is bound to pg_stat_statements_1_11.  Keep serving it,
+			 * with bind_types NULL, so the view works between the library upgrade
+			 * and ALTER EXTENSION ... UPDATE TO '1.11e2'.
+			 */
+			if (api_version != PGSS_V1_11)
+				elog(ERROR, "incorrect number of output arguments");
+			api_version = PGSS_V1_11E1;
 			break;
 		default:
 			elog(ERROR, "incorrect number of output arguments");
@@ -1779,6 +1867,7 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 		int64		queryid = entry->key.queryid;
 		TimestampTz stats_since;
 		TimestampTz minmax_stats_since;
+		TimestampTz stats_last;
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
@@ -1849,6 +1938,7 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			tmp = e->counters;
 			stats_since = e->stats_since;
 			minmax_stats_since = e->minmax_stats_since;
+			stats_last = e->stats_last;
 			SpinLockRelease(&e->mutex);
 		}
 
@@ -1948,6 +2038,34 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			values[i++] = TimestampTzGetDatum(stats_since);
 			values[i++] = TimestampTzGetDatum(minmax_stats_since);
 		}
+		if (api_version >= PGSS_V1_11E2)
+		{
+			/* eXperDB: NULL until the counters have been updated once */
+			if (stats_last != 0)
+				values[i++] = TimestampTzGetDatum(stats_last);
+			else
+				nulls[i++] = true;
+		}
+		if (api_version == PGSS_V1_11E1)
+		{
+			/* eXperDB: legacy 1.11e1 definition only; bind_types is not computed */
+			nulls[i++] = true;
+		}
+		if (api_version == PGSS_V1_10E2 || api_version == PGSS_V1_10E1)
+		{
+			/*
+			 * eXperDB: PostgreSQL 15/16 definitions kept by pg_upgrade: the 1.10
+			 * columns above, then stats_last, stats_since (and bind_types, NULL,
+			 * for 1.10e1).
+			 */
+			if (stats_last != 0)
+				values[i++] = TimestampTzGetDatum(stats_last);
+			else
+				nulls[i++] = true;
+			values[i++] = TimestampTzGetDatum(stats_since);
+			if (api_version == PGSS_V1_10E1)
+				nulls[i++] = true;
+		}
 
 		Assert(i == (api_version == PGSS_V1_0 ? PG_STAT_STATEMENTS_COLS_V1_0 :
 					 api_version == PGSS_V1_1 ? PG_STAT_STATEMENTS_COLS_V1_1 :
@@ -1956,7 +2074,11 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 					 api_version == PGSS_V1_8 ? PG_STAT_STATEMENTS_COLS_V1_8 :
 					 api_version == PGSS_V1_9 ? PG_STAT_STATEMENTS_COLS_V1_9 :
 					 api_version == PGSS_V1_10 ? PG_STAT_STATEMENTS_COLS_V1_10 :
+					 api_version == PGSS_V1_10E2 ? PG_STAT_STATEMENTS_COLS_V1_10E2 :
+					 api_version == PGSS_V1_10E1 ? PG_STAT_STATEMENTS_COLS_V1_10E1 :
 					 api_version == PGSS_V1_11 ? PG_STAT_STATEMENTS_COLS_V1_11 :
+					 api_version == PGSS_V1_11E2 ? PG_STAT_STATEMENTS_COLS_V1_11E2 :
+					 api_version == PGSS_V1_11E1 ? PG_STAT_STATEMENTS_COLS_V1_11E1 :
 					 -1 /* fail if you forget to update this assert */ ));
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
@@ -2068,6 +2190,7 @@ entry_alloc(pgssHashKey *key, Size query_offset, int query_len, int encoding,
 		entry->encoding = encoding;
 		entry->stats_since = GetCurrentTimestamp();
 		entry->minmax_stats_since = entry->stats_since;
+		entry->stats_last = 0;	/* eXperDB: no counters update yet */
 	}
 
 	return entry;
